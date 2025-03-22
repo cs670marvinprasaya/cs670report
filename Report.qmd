@@ -1,0 +1,1163 @@
+---
+title: "CS670 Data Science Project: Sentiment and Rating Analysis of Book Reviews"
+author: "Prasaya Acharya and Marvin Chan"
+date: "March 21 2025"
+format:
+    html:
+        toc: true
+        toc-depth: 4
+        code-fold: true
+execute:
+    echo: true
+jupyter: python3
+---
+
+## Introduction
+
+The goal of this project was to analyze the large UCSD BookGraph dataset of Goodreads book reviews and build models for sentiment analysis and rating prediction on those reviews. We were motivated our love of reading and by the rich content on Goodreads where reviews are often long and detailed. The BookGraph dataset allows us to explore how readers express sentiment in text and whether we can predict the star rating of a review from its text alone. We aimed to first conduct exploratory analysis of review characteristics (length, genres, etc.), then classify reviews as positive or negative, and finally predict the exact star rating (1–5) from the review text. By comparing different approaches, we aim to assess what techniques perform best on long-form book reviews and what insights can be gained from this literature-centric data.
+
+## Dataset
+
+Our data comes from the **Goodreads Book Reviews** corpus released as part of the UCSD BookGraph project by Wan and McAuley. This dataset contains **15 million reviews** for **2 million books** contributed by **465,000 users**​. The data was collected in the context of studying spoiler detection on Goodreads since Goodreads allows users to tag spoilers in their reviews​. For our purposes, we focused on the review texts and ratings. Each review includes: a textual review, a star rating (0–5 stars, where 0 indicates the user marked the book as not finished or not rated), a book ID (with associated metadata like genres in a separate file), and other info like the number of likes/upvotes on the review.
+
+Given the enormous size of the full dataset, we worked with a random sample of 20,000 reviews drawn from the larger set for our analysis and modeling. We first downloaded the relevant data files (book metadata and reviews) and performed parsing. The raw review file contained \~1.38 million reviews, this was a subset of the larger dataset focused on spoiler-tagged reviews). We loaded these into a DataFrame, merged in the book genre information by book ID, and then filtered the data. Notably, we removed entries with a 0-star rating (about 3% of the data) since these reviews are essentially *did-not-finish (DNF)* markers and not actual rated opinions​ . After dropping these, the ratings range from 1 to 5 stars. We also processed the text minimally – converting to lowercase and letting our modeling tools handle tokenization. For the Bag-of-Words and TF-IDF approaches, we relied on scikit-learn’s vectorizers with an English stopword list and set a minimum document frequency of 5 to ignore extremely rare words. The book genre data was parsed from a nested JSON into a list of genres for each book. We found 16 top-level genres after processing (e.g. Fiction, Fantasy, Romance, Non-fiction, etc.), which we used to examine genre trends.
+
+### Setup/preprocessing:
+
+Note: some code relevant to BERT has been commented out as we were unable to run Quarto on Talapas and therefore unable to render this report otherwise. We have manually supplemented the report with the relevant images and outputs.
+
+```{python}
+import gzip
+import json
+import re
+import os
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from wordcloud import WordCloud
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.pipeline import Pipeline
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import to_categorical
+# from transformers import DistilBertTokenizer, DistilBertForSequenceClassification, Trainer, TrainingArguments
+# import torch
+# from torch.utils.data import Dataset, DataLoader
+# import torch.nn as nn
+# import torch.optim as optim
+from tqdm.notebook import tqdm
+import random
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from collections import Counter
+
+# Download necessary NLTK data (if not already downloaded)
+try:
+    stopwords.words('english')
+except LookupError:
+    nltk.download('stopwords')
+try:
+    word_tokenize("example")
+except LookupError:
+    nltk.download('punkt')
+
+# Load data and sample - adjust file paths as necessary
+# Assuming data is in the same directory or adjust paths accordingly
+reviews_file = 'goodreads_reviews_spoiler_raw.json' # Or 'reviews_sample.json' if you have a smaller sample
+books_file = 'goodreads_book_genres_initial.json'
+
+# Load a small sample for faster prototyping, or load full dataset for comprehensive results
+# reviews = pd.read_json(reviews_file, lines=True, nrows=20000) # Sample load, faster for testing
+reviews = pd.read_json(reviews_file, lines=True) # Full load for comprehensive analysis
+books = pd.read_json(books_file, lines=True)
+
+# Drop 0 ratings (DNFs)
+reviews = reviews[reviews['rating'] != 0]
+
+# Function to parse genres
+def parse_genres(genre_dict):
+    if not isinstance(genre_dict, dict):
+        return []
+    all_genres = []
+    for genre_group in genre_dict.keys():
+        individual_genres = [g.strip() for g in genre_group.split(',')]
+        all_genres.extend(individual_genres)
+    return all_genres
+
+books['parsed_genres'] = books['genres'].apply(parse_genres)
+books.drop(columns=["genres"], inplace=True)
+books.rename(columns={"parsed_genres": "genres"}, inplace=True)
+
+# Sample reviews for faster processing during development - consider removing for final run
+reviews_sample = reviews.sample(n=20000, random_state=42) # Sampling 20000 reviews
+df = reviews_sample.copy() # Use the sample DataFrame for analysis
+
+# Merge reviews and books dataframes
+df_merged = pd.merge(df, books, on='book_id', how='inner')
+```
+
+## Exploratory Analysis
+
+Before building models, we performed an Exploratory Data Analysis (EDA) to understand the characteristics of the reviews. We first explored the distribution of ratings, the relationship between rating and review length, and the average rating across different genres. This initial exploration provides context for our modeling efforts and helps us understand the characteristics of the book review data.
+
+### Distribution of Ratings
+
+We examined the distribution of star ratings to understand the overall sentiment balance in the dataset. Most reviews are positive, with 4 and 5-star ratings being the most frequent. This positive skew suggests that Goodreads users tend to rate books favorably perhaps because they choose books they expect to enjoy or because extremely low ratings are less common to share. We also note that Goodreads allows a 0-star rating to mark unfinished books. About 3.4% of entries were 0, which we dropped as they are not true ratings.
+
+```{python}
+# Count the occurrences of each rating
+rating_counts = df['rating'].value_counts().sort_index()
+
+# Create figure and bar plot
+plt.figure(figsize=(10, 6))
+ax = sns.barplot(x=rating_counts.index, y=rating_counts.values, palette="viridis")
+
+# Add value labels on top of each bar
+for i, count in enumerate(rating_counts.values):
+    ax.text(i, count + (count*0.01), f'{count:,}', ha='center', fontweight='bold')
+
+# Add titles and labels
+plt.title('Distribution of Book Ratings', fontsize=16, fontweight='bold')
+plt.xlabel('Rating', fontsize=12)
+plt.ylabel('Count', fontsize=12)
+plt.xticks(fontsize=10)
+plt.yticks(fontsize=10)
+
+# Adjust layout and display
+plt.tight_layout()
+plt.show()
+
+# Print rating distribution statistics
+print(f"Total reviews: {len(df)}")
+print(f"Rating distribution percentage:")
+for rating, count in rating_counts.items():
+    print(f"Rating {rating}: {count/len(df) * 100:.2f}%")
+```
+
+### Rating vs. Review Text Word Count
+
+We next examined the length of reviews and whether longer reviews correlate with higher or lower ratings. To see if people write more when they love or hate a book, we created a scatter plot of ratings against the word count of reviews. The plot shows us that there is no statistically significant relation between these two variables, but there is a visual trend in the plot where it appears that the longest reviews tend to have higher ratings of the book. This suggests that review length is more of a personal style or how much a person has to say about the book, rather than directly to sentiment.
+
+```{python}
+# Calculate word count for each review
+df['word_count'] = df['review_text'].apply(lambda x: len(str(x).split()))
+
+# Create figure with appropriate size
+plt.figure(figsize=(12, 8))
+
+# Sample data for scatter plot to improve performance and readability
+sample_size = min(10000, len(df))
+reviews_sample = df.sample(sample_size, random_state=42)
+
+# Create scatter plot with transparency
+ax = sns.scatterplot(x='rating', y='word_count', data=reviews_sample, alpha=0.3)
+
+# Add trend line
+sns.regplot(x='rating', y='word_count', data=df, scatter=False, color='red', line_kws={'linewidth': 2})
+
+# Add labels and title
+plt.title('Rating vs Review Word Count', fontsize=16, fontweight='bold')
+plt.xlabel('Rating', fontsize=12)
+plt.ylabel('Word Count', fontsize=12)
+
+# Set x-axis to show ratings as discrete values
+plt.xticks([1, 2, 3, 4, 5])
+
+# Calculate and display correlation coefficient
+correlation = df[['rating', 'word_count']].corr().iloc[0, 1]
+plt.annotate(f'Correlation: {correlation:.3f}',
+             xy=(0.05, 0.95), xycoords='axes fraction',
+             fontsize=12, bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.5))
+
+# Calculate mean word count by rating and add to plot
+mean_counts = df.groupby('rating')['word_count'].mean()
+for rating, mean_count in mean_counts.items():
+    plt.annotate(f'Mean: {mean_count:.0f}',
+                 xy=(rating, mean_count),
+                 xytext=(0, 10), textcoords='offset points',
+                 ha='center', fontsize=10,
+                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.5))
+
+# Add grid for better readability
+plt.grid(True, alpha=0.3)
+
+# Tight layout and show plot
+plt.tight_layout()
+plt.show()
+
+# Print word count statistics by rating
+print("Word count statistics by rating:")
+for rating, group in df.groupby('rating'):
+    print(f"Rating {rating}: Mean={group['word_count'].mean():.1f}, Median={group['word_count'].median()}, Min={group['word_count'].min()}, Max={group['word_count'].max()}")
+```
+
+### Average Rating per Genre
+
+We then examined average book ratings across different genres.Each book in the dataset comes with genre tags, so we identified the set of distinct genres and counted reviews per genre. We looked at whether certain genres tend to get higher or lower ratings on average. We calculated the average rating for each genre and visualized these averages using a horizontal bar plot, sorted by average rating in descending order. We can see that genres like nonfiction and historical fiction are lower rated, while genres like comics and childrens' books are rated highest, but the genre difference in ratings is minimal.
+
+```{python}
+# Explode genres list to have one genre per row
+exploded_data = df_merged.explode('genres')
+
+# Group by genre and calculate average rating and count
+genre_ratings = exploded_data.groupby('genres')['rating'].agg(['mean', 'count']).sort_values(by='mean', ascending=False)
+genre_ratings = genre_ratings.reset_index() # Reset index to make 'genres' a column
+
+# Create figure with appropriate size
+plt.figure(figsize=(14, 10))
+
+# Use a Seaborn color palette
+palette = sns.color_palette("viridis", n_colors=len(genre_ratings))
+
+# Create horizontal bar plot
+bars = plt.barh(genre_ratings['genres'], genre_ratings['mean'], color=palette)
+plt.gca().invert_yaxis() # Invert y-axis to have highest rated genre at top
+
+# Add values on the bars
+for i, bar in enumerate(bars):
+    plt.text(bar.get_width() + 0.05,
+             bar.get_y() + bar.get_height()/2,
+             f'{genre_ratings["mean"].iloc[i]:.2f} ({genre_ratings["count"].iloc[i]:,})',
+             va='center',
+             fontweight='bold',
+             color='black')
+
+# Set labels and title
+plt.xlabel('Average Rating', fontsize=14, fontweight='bold')
+plt.ylabel('Genre', fontsize=14, fontweight='bold')
+plt.title('Average Book Ratings by Genre', fontsize=18, fontweight='bold')
+plt.xlim(0, 5.5) # Set x-axis limit for better visualization
+
+# Style grid
+plt.grid(axis='x', linestyle='--', alpha=0.6)
+
+# Style tick labels
+plt.xticks(fontsize=11)
+plt.yticks(fontsize=11)
+
+# Adjust layout and display
+plt.tight_layout()
+plt.show()
+
+# Print genre rating statistics
+print(f"Number of genres: {len(genre_ratings)}")
+print(f"Genre with highest average rating: {genre_ratings.iloc[0]['genres']} ({genre_ratings.iloc[0]['mean']:.2f})")
+print(f"Genre with lowest average rating: {genre_ratings.iloc[-1]['genres']} ({genre_ratings.iloc[-1]['mean']:.2f})")
+```
+
+## Sentiment Analysis
+
+Our first modeling task was sentiment analysis, where we aimed to classify book reviews as either positive or negative based on their text. For sentiment analysis, we labeled reviews with rating 4 or 5 as positive and rating 1, 2, or 3 as negative. We experimented with Bag-of-Words and TF-IDF vectorization combined with Logistic Regression and Simple Neural Networks, and then fine tuned a DistilBERT-based model for comparison.
+
+### Bag of Words and TF-IDF with Logistic Regression
+
+We used Bag-of-Words (BoW) and Term Frequency-Inverse Document Frequency (TF-IDF) to convert the review texts into numerical vectors.
+
+In a BoW model, each review is represented by features indicating the presence or frequency of words, disregarding order. We limited the vocabulary to the 5,000 most frequent words in the corpus to reduce dimensionality and ignored words that appeared in fewer than 5 reviews to drop rare outliers. Next, we used TF‑IDF features instead of raw word counts. Term Frequency–Inverse Document Frequency weighs words by how unique they are to a document i.e. words that appear frequently in a review but not in many other reviews get a higher weight. This can help down-weight very common words.
+
+These vectors were then used to train Logistic Regression classifiers. We evaluated performance using accuracy, classification reports, and confusion matrices. We also analyzed feature importance to identify the words most indicative of positive and negative sentiment.
+
+#### Bag of Words Model
+
+```{python}
+# Define sentiment based on rating (positive if rating > 3, negative otherwise)
+df['sentiment'] = df['rating'].apply(lambda x: 'positive' if x > 3 else 'negative')
+
+# Split data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(
+    df['review_text'],
+    df['sentiment'].map({'positive': 1, 'negative': 0}), # Map sentiment to numerical labels
+    test_size=0.2,
+    random_state=42
+)
+
+# Pipeline with CountVectorizer and Logistic Regression
+pipeline_bow = Pipeline([
+    ('vectorizer', CountVectorizer(max_features=5000, min_df=5, stop_words='english')), # Bag of Words vectorization
+    ('classifier', LogisticRegression(max_iter=1000, C=1.0)) # Logistic Regression classifier
+])
+
+# Train the model
+pipeline_bow.fit(X_train, y_train)
+
+# Make predictions
+y_pred_bow = pipeline_bow.predict(X_test)
+
+# Evaluate the model
+accuracy_bow_logistic = accuracy_score(y_test, y_pred_bow)
+print(f"Accuracy (Bag of Words + Logistic Regression): {accuracy_bow_logistic:.5f}")
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred_bow))
+
+# Get confusion matrix
+cm_bow = confusion_matrix(y_test, y_pred_bow)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm_bow, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['Negative', 'Positive'],
+            yticklabels=['Negative', 'Positive'])
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix: Bag of Words + Logistic Regression')
+plt.tight_layout()
+plt.show()
+
+# Feature Importance Analysis for Bag of Words Model
+vectorizer_bow = pipeline_bow.named_steps['vectorizer']
+classifier_bow = pipeline_bow.named_steps['classifier']
+feature_names_bow = vectorizer_bow.get_feature_names_out()
+coefs_bow = classifier_bow.coef_[0]
+
+# Top negative and positive words
+top_negative_words_bow = pd.DataFrame({'word': [feature_names_bow[idx] for idx in coefs_bow.argsort()[:25]], 'Coefficient': sorted(coefs_bow)[:25]})
+top_positive_words_bow = pd.DataFrame({'word': [feature_names_bow[idx] for idx in coefs_bow.argsort()[-25:]][::-1], 'Coefficient': sorted(coefs_bow)[-25:][::-1]})
+
+print("\nTop negative words (Bag of Words):")
+display(top_negative_words_bow)
+print("\nTop positive words (Bag of Words):")
+display(top_positive_words_bow)
+
+# Word Cloud for Negative Sentiment (Bag of Words)
+negative_word_importance_bow = {top_negative_words_bow['word'][i]: abs(top_negative_words_bow['Coefficient'][i]) for i in range(len(top_negative_words_bow))}
+wordcloud_neg_bow = WordCloud(width=1000, height=1000, background_color='white', max_words=150, colormap='Reds', prefer_horizontal=1.0).generate_from_frequencies(negative_word_importance_bow)
+plt.figure(figsize=(10, 8))
+plt.imshow(wordcloud_neg_bow, interpolation='bilinear')
+plt.axis('off')
+plt.title('Negative Sentiment Word Cloud (Bag of Words)', fontsize=20)
+plt.show()
+
+# Word Cloud for Positive Sentiment (Bag of Words)
+positive_word_importance_bow = {top_positive_words_bow['word'][i]: top_positive_words_bow['Coefficient'][i] for i in range(len(top_positive_words_bow))}
+wordcloud_pos_bow = WordCloud(width=1000, height=1000, background_color='white', max_words=150, colormap='Greens', prefer_horizontal=1.0).generate_from_frequencies(positive_word_importance_bow)
+plt.figure(figsize=(10, 8))
+plt.imshow(wordcloud_pos_bow, interpolation='bilinear')
+plt.axis('off')
+plt.title('Positive Sentiment Word Cloud (Bag of Words)', fontsize=20)
+plt.show()
+```
+
+#### TF-IDF Model
+
+```{python}
+# Pipeline with TfidfVectorizer and Logistic Regression
+pipeline_tfidf = Pipeline([
+    ('vectorizer', TfidfVectorizer(max_features=5000, min_df=5, stop_words='english')), # TF-IDF vectorization
+    ('classifier', LogisticRegression(max_iter=1000, C=1.0)) # Logistic Regression classifier
+])
+
+# Train the TF-IDF model
+pipeline_tfidf.fit(X_train, y_train)
+
+# Make predictions
+y_pred_tfidf = pipeline_tfidf.predict(X_test)
+
+# Evaluate the TF-IDF model
+accuracy_tfidf_logistic = accuracy_score(y_test, y_pred_tfidf)
+print(f"Accuracy (TF-IDF + Logistic Regression): {accuracy_tfidf_logistic:.5f}")
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred_tfidf))
+
+# Confusion Matrix for TF-IDF Model
+cm_tfidf = confusion_matrix(y_test, y_pred_tfidf)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm_tfidf, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['Negative', 'Positive'],
+            yticklabels=['Negative', 'Positive'])
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix: TF-IDF + Logistic Regression')
+plt.tight_layout()
+plt.show()
+
+# Feature Importance Analysis for TF-IDF Model
+vectorizer_tfidf = pipeline_tfidf.named_steps['vectorizer']
+classifier_tfidf = pipeline_tfidf.named_steps['classifier']
+feature_names_tfidf = vectorizer_tfidf.get_feature_names_out()
+coefs_tfidf = classifier_tfidf.coef_[0]
+
+# Top negative and positive words for TF-IDF
+top_negative_words_tfidf = pd.DataFrame({'word': [feature_names_tfidf[idx] for idx in coefs_tfidf.argsort()[:25]], 'Coefficient': sorted(coefs_tfidf)[:25]})
+top_positive_words_tfidf = pd.DataFrame({'word': [feature_names_tfidf[idx] for idx in coefs_tfidf.argsort()[-25:]][::-1], 'Coefficient': sorted(coefs_tfidf)[-25:][::-1]})
+
+print("\nTop negative words (TF-IDF):")
+display(top_negative_words_tfidf)
+print("\nTop positive words (TF-IDF):")
+display(top_positive_words_tfidf)
+
+# Word Cloud for Negative Sentiment (TF-IDF)
+negative_word_importance_tfidf = {top_negative_words_tfidf['word'][i]: abs(top_negative_words_tfidf['Coefficient'][i]) for i in range(len(top_negative_words_tfidf))}
+wordcloud_neg_tfidf = WordCloud(width=1000, height=1000, background_color='white', max_words=150, colormap='Reds', prefer_horizontal=1.0).generate_from_frequencies(negative_word_importance_tfidf)
+plt.figure(figsize=(10, 8))
+plt.imshow(wordcloud_neg_tfidf, interpolation='bilinear')
+plt.axis('off')
+plt.title('Negative Sentiment Word Cloud (TF-IDF)', fontsize=20)
+plt.show()
+
+# Word Cloud for Positive Sentiment (TF-IDF)
+positive_word_importance_tfidf = {top_positive_words_tfidf['word'][i]: top_positive_words_tfidf['Coefficient'][i] for i in range(len(top_positive_words_tfidf))}
+wordcloud_pos_tfidf = WordCloud(width=1000, height=1000, background_color='white', max_words=150, colormap='Greens', prefer_horizontal=1.0).generate_from_frequencies(positive_word_importance_tfidf)
+plt.figure(figsize=(10, 8))
+plt.imshow(wordcloud_pos_tfidf, interpolation='bilinear')
+plt.axis('off')
+plt.title('Positive Sentiment Word Cloud (TF-IDF)', fontsize=20)
+plt.show()
+```
+
+### TF-IDF with Simple Neural Network
+
+To explore a more complex model for sentiment classification, we implemented a simple feed-forward Neural Network (NN) using TensorFlow/Keras. The idea was to see if a non-linear model could capture signals that logistic regression (which is linear) might miss. We used TF-IDF features as input to this network and evaluated its performance against Logistic Regression and Bag-of-Words models. In practice, we found the neural network was prone to overfitting the training data quickly, given we had only 16k training examples and 5000 features. We had difficulty running the model on the full dataset due to our hardware memory constraints.
+
+```{python}
+# TF-IDF vectorization for Neural Network input
+vectorizer_nn_sentiment = TfidfVectorizer(max_features=5000, min_df=5, stop_words='english')
+X_train_tfidf_nn_sentiment = vectorizer_nn_sentiment.fit_transform(X_train).toarray()
+X_test_tfidf_nn_sentiment = vectorizer_nn_sentiment.transform(X_test).toarray()
+input_dim_nn_sentiment = X_train_tfidf_nn_sentiment.shape[1]
+
+# Define the Neural Network model
+model_nn_sentiment = Sequential([
+    Dense(128, activation='relu', input_shape=(input_dim_nn_sentiment,)),
+    Dropout(0.3),
+    Dense(64, activation='relu'),
+    Dropout(0.2),
+    Dense(1, activation='sigmoid') # Sigmoid for binary classification
+])
+
+# Compile the model
+model_nn_sentiment.compile(optimizer=Adam(learning_rate=0.001),
+              loss='binary_crossentropy',
+              metrics=['accuracy'])
+
+# Train the model
+history_nn_sentiment = model_nn_sentiment.fit(X_train_tfidf_nn_sentiment, y_train,
+                    epochs=10, batch_size=64,
+                    validation_split=0.1, verbose=1)
+
+# Evaluate the model
+_, accuracy_nn_sentiment = model_nn_sentiment.evaluate(X_test_tfidf_nn_sentiment, y_test, verbose=0)
+print(f"Accuracy (TF-IDF + Neural Network for sentiment analysis): {accuracy_nn_sentiment:.4f}")
+
+# Predictions and Classification Report
+y_pred_prob_nn_sentiment = model_nn_sentiment.predict(X_test_tfidf_nn_sentiment)
+y_pred_nn_sentiment = (y_pred_prob_nn_sentiment > 0.5).astype(int).flatten()
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred_nn_sentiment))
+
+# Confusion Matrix for Neural Network
+cm_nn_sentiment = confusion_matrix(y_test, y_pred_nn_sentiment)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm_nn_sentiment, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['Negative', 'Positive'],
+            yticklabels=['Negative', 'Positive'])
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix: TF-IDF + Neural Network for Sentiment Analysis')
+plt.tight_layout()
+plt.show()
+
+# Plot training history
+plt.figure(figsize=(12, 5))
+
+# Plot accuracy
+plt.subplot(1, 2, 1)
+plt.plot(history_nn_sentiment.history['accuracy'], label='Train Accuracy')
+plt.plot(history_nn_sentiment.history['val_accuracy'], label='Validation Accuracy')
+plt.title('Model Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+# Plot loss
+plt.subplot(1, 2, 2)
+plt.plot(history_nn_sentiment.history['loss'], label='Train Loss')
+plt.plot(history_nn_sentiment.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# Feature Importance - using weights from the first layer of the NN
+weights_nn_sentiment = model_nn_sentiment.layers[0].get_weights()[0]
+feature_importance_nn_sentiment = np.mean(np.abs(weights_nn_sentiment), axis=1)
+
+top_indices_nn_sentiment = feature_importance_nn_sentiment.argsort()[-30:][::-1]
+df_importance_nn_sentiment = pd.DataFrame({
+    'Word': [vectorizer_nn_sentiment.get_feature_names_out()[idx] for idx in top_indices_nn_sentiment],
+    'Importance': feature_importance_nn_sentiment[top_indices_nn_sentiment]
+})
+
+plt.figure(figsize=(10, 12))
+sns.barplot(x='Importance', y='Word', data=df_importance_nn_sentiment, palette='viridis')
+plt.title('Neural Network Feature Importance', fontsize=15)
+plt.xlabel('Mean Absolute Weight', fontsize=12)
+plt.tight_layout()
+plt.show()
+```
+
+### Comparison of BoW, TF-IDF and NN Models
+
+We compared the accuracy of the Bag-of-Words, TF-IDF, and TF-IDF Neural Network models using a bar chart to visualize their performance side-by-side. TF-IDF showed a slight improvement in accuracy over Bag-of-Words, and the Neural Network performed similarly to TF-IDF with Logistic Regression.
+
+```{python}
+# Compare model accuracies in a bar plot
+models_sentiment = ['BOW + LogReg', 'TF-IDF + LogReg', 'TF-IDF + NN']
+accuracies_sentiment = [accuracy_bow_logistic, accuracy_tfidf_logistic, accuracy_nn_sentiment]
+
+# Create DataFrame for plotting
+df_metrics_sentiment = pd.DataFrame({'Model': models_sentiment, 'Accuracy': accuracies_sentiment})
+
+# Create bar chart
+plt.figure(figsize=(10, 6))
+ax = sns.barplot(x='Model', y='Accuracy', data=df_metrics_sentiment, palette=['#FF9671', '#FFC75F', '#845EC2'])
+
+# Add value labels on top of bars
+for i, acc in enumerate(accuracies_sentiment):
+    ax.text(i, acc + 0.005, f'{acc:.4f}', ha='center', fontweight='bold')
+
+# Add labels and title
+plt.title('Model Accuracy Comparison for Sentiment Analysis', fontsize=16)
+plt.ylabel('Accuracy', fontsize=14)
+plt.ylim(0, 0.85) # Adjust y-axis limit for better visualization
+
+# Show plot
+plt.tight_layout()
+plt.show()
+```
+
+### DistilBERT for Sentiment Analysis
+
+The most advanced approach we tried was fine-tuning a DistilBERT model for our tasks. DistilBERT is a smaller, faster variant of the BERT transformer model that still retains much of BERT’s language understanding capabilities. It comes pre-trained on a large corpus and can be fine-tuned on a specific task with labeled data. We used Hugging Face’s Transformers library to load the distilbert-base-uncased model and added a classification layer on top. We then fine-tuned DistilBERT on our training set by feeding in the review text and training the model to predict the sentiment or rating. We expected transformer-based DistilBERT to outperform the simpler models because it can understand word order, context, and even semantics of the text. 
+We used Talapas to fine-tune the DistilBERT model.
+
+```{python}
+#| eval: false
+
+# Set device for GPU if available, otherwise CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load DistilBERT tokenizer and model for sequence classification
+tokenizer_bert = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+model_bert = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=2) # 2 labels: positive, negative
+model_bert.to(device) # Move model to GPU if available
+
+# Dataset class for DistilBERT
+class SentimentDatasetBERT(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len=128): # Adjusted max_len for BERT
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts.iloc[idx])
+        label = int(self.labels.iloc[idx])
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_len,
+            return_tensors='pt'
+        )
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+# Create datasets and dataloaders for BERT
+train_dataset_bert = SentimentDatasetBERT(X_train, y_train, tokenizer_bert)
+test_dataset_bert = SentimentDatasetBERT(X_test, y_test, tokenizer_bert)
+
+train_loader_bert = DataLoader(train_dataset_bert, batch_size=32, shuffle=True) # Increased batch size for BERT
+test_loader_bert = DataLoader(test_dataset_bert, batch_size=32, shuffle=False)
+
+# Optimizer for BERT model
+optimizer_bert = optim.AdamW(model_bert.parameters(), lr=2e-5)
+criterion_bert = nn.CrossEntropyLoss()
+
+# Training function for BERT model
+def train_model_bert(model, train_loader, optimizer, criterion, epochs=3, device='cuda'):
+    model.train()
+    model.to(device)  # Ensure model is on the correct device
+    history = {'loss': [], 'val_loss': [], 'accuracy': [], 'val_accuracy': []} # Training history
+
+    for epoch in range(epochs):
+        total_loss = 0
+        correct_predictions = 0
+        total_samples = 0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=True)
+
+        for batch in progress_bar:
+            optimizer.zero_grad()
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss
+            logits = outputs.logits
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            predictions = torch.argmax(logits, dim=1)
+            correct_predictions += (predictions == labels).sum().item()
+            total_samples += labels.size(0)
+
+            progress_bar.set_postfix(loss=total_loss / len(progress_bar), acc=correct_predictions/total_samples)
+
+        avg_loss = total_loss / len(train_loader)
+        train_accuracy = correct_predictions / total_samples
+
+        # Validation step (optional, but good practice - omitted here for brevity but recommended for full projects)
+
+        print(f"Epoch {epoch+1} completed. Avg Loss: {avg_loss:.4f}, Train Accuracy: {train_accuracy:.4f}")
+        history['loss'].append(avg_loss)
+        history['accuracy'].append(train_accuracy)
+
+    return history
+
+# Evaluate function for BERT model
+def evaluate_model_bert(model, test_loader, device='cuda'):
+    model.eval()
+    model.to(device) # Ensure model is on the correct device
+    y_pred, y_true = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            logits = outputs.logits
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            labels_cpu = labels.cpu().numpy()
+
+            y_pred.extend(preds)
+            y_true.extend(labels_cpu)
+    return y_true, y_pred
+
+# Train the DistilBERT model (adjust epochs as needed - 3-5 epochs is reasonable for demonstration)
+bert_history = train_model_bert(model_bert, train_loader_bert, optimizer_bert, criterion_bert, epochs=3, device=device)
+
+# Evaluate DistilBERT model
+y_true_bert, y_pred_bert = evaluate_model_bert(model_bert, test_loader_bert, device=device)
+
+# Calculate accuracy and print classification report for BERT
+accuracy_bert = accuracy_score(y_true_bert, y_pred_bert)
+print(f"\\nAccuracy (DistilBERT for sentiment analysis): {accuracy_bert:.4f}")
+print("\\nClassification Report (DistilBERT):")
+print(classification_report(y_true_bert, y_pred_bert))
+
+# Confusion Matrix for DistilBERT
+cm_bert = confusion_matrix(y_true_bert, y_pred_bert)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm_bert, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['Negative', 'Positive'],
+            yticklabels=['Negative', 'Positive'])
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix: DistilBERT for Sentiment Analysis')
+plt.tight_layout()
+plt.show()
+
+# Compare all model accuracies in a bar plot including BERT
+models_all_sentiment = ['BOW + LogReg', 'TF-IDF + LogReg', 'DistilBERT']
+accuracies_all_sentiment = [accuracy_bow_logistic, accuracy_tfidf_logistic, accuracy_bert]
+
+df_metrics_all_sentiment = pd.DataFrame({'Model': models_all_sentiment, 'Accuracy': accuracies_all_sentiment})
+
+plt.figure(figsize=(10, 6))
+ax_all_sent = sns.barplot(x='Model', y='Accuracy', data=df_metrics_all_sentiment, palette=['#FF9671', '#FFC75F', '#845EC2'])
+for i, acc in enumerate(accuracies_all_sentiment):
+    ax_all_sent.text(i, acc + 0.005, f'{acc:.4f}', ha='center', fontweight='bold')
+
+plt.title('Model Accuracy Comparison for Sentiment Analysis (including DistilBERT)', fontsize=16)
+plt.ylabel('Accuracy', fontsize=14)
+plt.ylim(0, 0.9) # Adjust y-axis limit
+
+plt.tight_layout()
+plt.show()
+```
+
+DistilBERT ended up achieving a score of **80.40% accuracy**.
+
+Here is the confusion matrix produced:
+
+![BERT_Sentiment_Confusion](./BERT_Sentiment.png)
+
+DistilBERT achieved the highest accuracy in sentiment classification, outperforming both Bag-of-Words and TF-IDF models with Logistic Regression. This improvement comes at the cost of increased computational complexity and training time, but demonstrates the potential benefits of using transformer-based models for sentiment analysis on book reviews.
+
+## Multiclass Classification
+
+Our next task was to predict the exact star rating (1 to 5) of a review directly. We treated this as a 5-class classification task. We considered a regression approach to predict a continuous rating, but since ratings in the dataset are discrete, classification with discrete classes was more straightforward for evaluation. This task is substantially harder than binary sentiment, the model must discern fine differences, not just positive vs negative. We started with using a multinomial logistic regression to predict one of the five rating classes. We again started with Bag-of-Words and TF-IDF with Logistic Regression, and then explored a feed-forward Neural Network model for multiclass classification and also fine tuned DistilBER.
+
+### Bag of Words and TF-IDF with Logistic Regression for Rating Prediction
+
+We extended our use of Bag-of-Words and TF-IDF to predict ratings on a 1-to-5 scale. Logistic Regression was adapted for multiclass classification using the 'multinomial' setting.
+
+#### Bag of Words for Rating Prediction
+
+```{python}
+# Split data for rating prediction (using original ratings 1-5)
+X_train_rating, X_test_rating, y_train_rating, y_test_rating = train_test_split(
+    df['review_text'],
+    df['rating'], # Use original ratings (1-5)
+    test_size=0.2,
+    random_state=42
+)
+
+# Pipeline with CountVectorizer and Logistic Regression for multiclass classification
+pipeline_bow_rating = Pipeline([
+    ('vectorizer', CountVectorizer(max_features=5000, min_df=5, stop_words='english')),
+    ('classifier', LogisticRegression(max_iter=1000, C=1.0, multi_class='multinomial')) # Specify multi_class='multinomial'
+])
+
+# Train the model
+pipeline_bow_rating.fit(X_train_rating, y_train_rating)
+
+# Make predictions
+y_pred_rating_bow = pipeline_bow_rating.predict(X_test_rating)
+
+# Evaluate the model
+accuracy_bow_rating_logistic = accuracy_score(y_test_rating, y_pred_rating_bow)
+print(f"Accuracy (Bag of Words + Logistic Regression for ratings): {accuracy_bow_rating_logistic:.4f}")
+print("\nClassification Report:")
+print(classification_report(y_test_rating, y_pred_rating_bow))
+
+# Confusion Matrix
+cm_rating_bow = confusion_matrix(y_test_rating, y_pred_rating_bow)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm_rating_bow, annot=True, fmt='d', cmap='Blues',
+            xticklabels=[1, 2, 3, 4, 5],
+            yticklabels=[1, 2, 3, 4, 5])
+plt.xlabel('Predicted Rating')
+plt.ylabel('True Rating')
+plt.title('Confusion Matrix: BoW + Logistic Regression for Ratings')
+plt.tight_layout()
+plt.show()
+
+# Feature Importance for each rating class (example for ratings 1-5)
+vectorizer_rating_bow = pipeline_bow_rating.named_steps['vectorizer']
+classifier_rating_bow = pipeline_bow_rating.named_steps['classifier']
+feature_names_rating_bow = vectorizer_rating_bow.get_feature_names_out()
+
+for rating_class in range(1, 6):
+    # Coefficients for each class (ratings 1 to 5)
+    if hasattr(classifier_rating_bow, 'coef_') and classifier_rating_bow.coef_.shape[0] >= rating_class:
+        coefs_rating = classifier_rating_bow.coef_[rating_class-1] # Adjust index for 0-based indexing
+
+        # Top words for each rating
+        top_words_rating = pd.DataFrame({
+            'Word': [feature_names_rating_bow[idx] for idx in coefs_rating.argsort()[-15:]][::-1],
+            'Coefficient': sorted(coefs_rating)[-15:][::-1]
+        })
+
+        print(f"\nTop words associated with rating {rating_class}:")
+        display(top_words_rating)
+```
+
+#### TF-IDF for Rating Prediction
+
+```{python}
+# Pipeline with TF-IDF and Logistic Regression for multiclass classification
+pipeline_tfidf_rating = Pipeline([
+    ('vectorizer', TfidfVectorizer(max_features=5000, min_df=5, stop_words='english')),
+    ('classifier', LogisticRegression(max_iter=1000, C=1.0, multi_class='multinomial'))
+])
+
+# Train the TF-IDF model for rating prediction
+pipeline_tfidf_rating.fit(X_train_rating, y_train_rating)
+
+# Make predictions
+y_pred_rating_tfidf = pipeline_tfidf_rating.predict(X_test_rating)
+
+# Evaluate the model
+accuracy_tfidf_rating_logistic = accuracy_score(y_test_rating, y_pred_rating_tfidf)
+print(f"Accuracy (TF-IDF + Logistic Regression for ratings): {accuracy_tfidf_rating_logistic:.4f}")
+print("\nClassification Report:")
+print(classification_report(y_test_rating, y_pred_rating_tfidf))
+
+# Confusion Matrix
+cm_rating_tfidf = confusion_matrix(y_test_rating, y_pred_rating_tfidf)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm_rating_tfidf, annot=True, fmt='d', cmap='Blues',
+            xticklabels=[1, 2, 3, 4, 5],
+            yticklabels=[1, 2, 3, 4, 5])
+plt.xlabel('Predicted Rating')
+plt.ylabel('True Rating')
+plt.title('Confusion Matrix: TF-IDF + Logistic Regression for Ratings')
+plt.tight_layout()
+plt.show()
+
+# Feature Importance for each rating class (example for ratings 1-5)
+vectorizer_rating_tfidf = pipeline_tfidf_rating.named_steps['vectorizer']
+classifier_rating_tfidf = pipeline_tfidf_rating.named_steps['classifier']
+feature_names_rating_tfidf = vectorizer_rating_tfidf.get_feature_names_out()
+
+for rating_class in range(1, 6):
+    if hasattr(classifier_rating_tfidf, 'coef_') and classifier_rating_tfidf.coef_.shape[0] >= rating_class:
+        coefs_rating = classifier_rating_tfidf.coef_[rating_class-1]
+
+        top_words_rating = pd.DataFrame({
+            'Word': [feature_names_rating_tfidf[idx] for idx in coefs_rating.argsort()[-15:]][::-1],
+            'Coefficient': sorted(coefs_rating)[-15:][::-1]
+        })
+
+        print(f"\nTop words associated with rating {rating_class}:")
+        display(top_words_rating)
+```
+
+
+### TF-IDF with Simple Neural Network for Rating Prediction
+
+To explore a more complex model, we implemented a simple Neural Network (NN) using TensorFlow/Keras for multiclass rating prediction. We extended the neural network approach to the 5-class scenario by using a final layer with 5 neurons. The model outputs a probability distribution across the 5 rating classes for each review. We used TF-IDF features as input to this network and compared its performance against Logistic Regression.
+
+```{python}
+# Convert ratings to categorical for NN
+y_train_categorical = to_categorical(y_train_rating - 1, num_classes=5) # -1 to make ratings 0-indexed
+y_test_categorical = to_categorical(y_test_rating - 1, num_classes=5)
+
+# TF-IDF vectorization for Neural Network input
+vectorizer_nn = TfidfVectorizer(max_features=5000, min_df=5, stop_words='english')
+X_train_tfidf_nn = vectorizer_nn.fit_transform(X_train_rating).toarray()
+X_test_tfidf_nn = vectorizer_nn.transform(X_test_rating).toarray()
+input_dim_nn = X_train_tfidf_nn.shape[1]
+
+# Define the Neural Network model
+model_nn = Sequential([
+    Dense(128, activation='relu', input_shape=(input_dim_nn,)),
+    Dropout(0.4),
+    Dense(64, activation='relu'),
+    Dropout(0.3),
+    Dense(32, activation='relu'),
+    Dropout(0.2),
+    Dense(5, activation='softmax') # 5 classes for ratings 1-5
+])
+
+# Compile the model
+model_nn.compile(optimizer=Adam(learning_rate=0.001),
+              loss='categorical_crossentropy',
+              metrics=['accuracy'])
+
+# Train the model
+history_nn = model_nn.fit(X_train_tfidf_nn, y_train_categorical,
+                    epochs=15, batch_size=64,
+                    validation_split=0.1, verbose=1)
+
+# Evaluate the model
+_, accuracy_nn = model_nn.evaluate(X_test_tfidf_nn, y_test_categorical, verbose=0)
+print(f"Accuracy (TF-IDF + Neural Network for ratings): {accuracy_nn:.4f}")
+
+# Predictions and Classification Report
+y_pred_prob_nn = model_nn.predict(X_test_tfidf_nn)
+y_pred_classes_nn = np.argmax(y_pred_prob_nn, axis=1)
+y_pred_nn = y_pred_classes_nn + 1 # Convert back to original rating scale (1-5)
+print("\nClassification Report:")
+print(classification_report(y_test_rating, y_pred_nn))
+
+# Confusion Matrix for Neural Network
+cm_nn = confusion_matrix(y_test_rating, y_pred_nn)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm_nn, annot=True, fmt='d', cmap='Blues',
+            xticklabels=[1, 2, 3, 4, 5],
+            yticklabels=[1, 2, 3, 4, 5])
+plt.xlabel('Predicted Rating')
+plt.ylabel('True Rating')
+plt.title('Confusion Matrix: TF-IDF + Neural Network for Ratings')
+plt.tight_layout()
+plt.show()
+
+# Plot training history
+plt.figure(figsize=(12, 5))
+
+# Plot accuracy
+plt.subplot(1, 2, 1)
+plt.plot(history_nn.history['accuracy'], label='Train Accuracy')
+plt.plot(history_nn.history['val_accuracy'], label='Validation Accuracy')
+plt.title('Model Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+# Plot loss
+plt.subplot(1, 2, 2)
+plt.plot(history_nn.history['loss'], label='Train Loss')
+plt.plot(history_nn.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# Feature Importance - using weights from the first layer of the NN
+# (Note: Feature importance in NNs is complex and this is a simplified approach)
+weights_nn = model_nn.layers[0].get_weights()[0] # Weights of the first Dense layer
+feature_importance_nn = np.mean(np.abs(weights_nn), axis=1) # Mean absolute weight for each feature
+
+top_indices_nn = feature_importance_nn.argsort()[-30:][::-1] # Top 30 features
+df_importance_nn = pd.DataFrame({
+    'Word': [vectorizer_nn.get_feature_names_out()[idx] for idx in top_indices_nn],
+    'Importance': feature_importance_nn[top_indices_nn]
+})
+
+plt.figure(figsize=(10, 12))
+sns.barplot(x='Importance', y='Word', data=df_importance_nn, palette='viridis')
+plt.title('Neural Network Feature Importance', fontsize=15)
+plt.xlabel('Mean Absolute Weight', fontsize=12)
+plt.tight_layout()
+plt.show()
+```
+
+#### Comparison of Models for Rating Prediction
+
+We compared the accuracy of all three models used for rating prediction: Bag-of-Words Logistic Regression, TF-IDF Logistic Regression, and TF-IDF Neural Network. TF-IDF with Logistic Regression performed slightly better than Bag-of-Words, while the Neural Network achieved a comparable accuracy. It is worth noting that predicting the exact rating is essentially a fine-grained sentiment analysis problem. A model might easily catch that a review is generally positive but still miss whether it is 4-star or 5-star. So we expected that even our best model might only achieve moderate accuracy.
+
+```{python}
+# Compare model accuracies for rating prediction including NN
+models_rating_all = ['BoW + LogReg', 'TF-IDF + LogReg', 'TF-IDF + NN']
+accuracies_rating_all = [accuracy_bow_rating_logistic, accuracy_tfidf_rating_logistic, accuracy_nn]
+
+df_metrics_rating_all = pd.DataFrame({'Model': models_rating_all, 'Accuracy': accuracies_rating_all})
+
+plt.figure(figsize=(10, 6))
+ax_rating_all = sns.barplot(x='Model', y='Accuracy', data=df_metrics_rating_all, palette=['#FF9671', '#FFC75F', '#845EC2'])
+for i, acc in enumerate(accuracies_rating_all):
+    ax_rating_all.text(i, acc + 0.005, f'{acc:.4f}', ha='center', fontweight='bold')
+
+plt.title('Model Accuracy Comparison for Multiclass Rating Prediction', fontsize=16)
+plt.ylabel('Accuracy', fontsize=14)
+plt.ylim(0, 0.6) # Adjust y-axis limit
+
+plt.tight_layout()
+plt.show()
+```
+
+### Word Clouds for Rating Prediction
+
+To further explore the features learned by our models, we generated word clouds that visualize the most important words associated with each star rating (1-5) based on the coefficients from the TF-IDF Logistic Regression model.
+
+```{python}
+# Generate word clouds for each rating based on TF-IDF Logistic Regression model coefficients
+vectorizer_wc = pipeline_tfidf_rating.named_steps['vectorizer']
+classifier_wc = pipeline_tfidf_rating.named_steps['classifier']
+feature_names_wc = vectorizer_wc.get_feature_names_out()
+
+plt.figure(figsize=(20, 16))
+
+for rating_class in range(1, 6):
+    if hasattr(classifier_wc, 'coef_') and classifier_wc.coef_.shape[0] >= rating_class:
+        coefs_wc = classifier_wc.coef_[rating_class-1]
+        word_importance_wc = {feature_names_wc[i]: coefs_wc[i] for i in range(len(feature_names_wc))}
+
+        # Filter out negative coefficients for positive word cloud
+        positive_word_importance_wc = {word: score for word, score in word_importance_wc.items() if score > 0}
+
+        wordcloud_rating = WordCloud(width=1000, height=1000, background_color='white', max_words=150, colormap='viridis', prefer_horizontal=1.0).generate_from_frequencies(positive_word_importance_wc)
+
+        plt.subplot(2, 3, rating_class)
+        plt.imshow(wordcloud_rating, interpolation='bilinear')
+        plt.axis('off')
+        plt.title(f'Top Words for Rating {rating_class}', fontsize=18)
+
+plt.tight_layout(pad=2)
+plt.show()
+```
+
+### BERT for Rating Prediction
+
+Finally, we fine-tuned DistilBERT to predict one of 5 classes.
+The model was trained to minimize multi-class classification loss. This model has the benefit of understanding context. For instance, it might pick up on nuanced phrases like “I really wanted to love this book” which could signal a disappointed 2 or 3-star sentiment hidden in otherwise positive wording. We hoped that the pre-trained knowledge in BERT would help it recognize intensity or tone indicators in the text that correlate with the star rating. We compared its rating prediction accuracy to the simpler models.
+
+```{python}
+#| eval: false
+
+# Adjust labels to be 0-indexed for categorical crossentropy in PyTorch
+y_train_rating_adjusted = y_train_rating - 1
+y_test_rating_adjusted = y_test_rating - 1
+
+# Dataset class for BERT for rating prediction
+class RatingDatasetBERT(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len=128):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts.iloc[idx])
+        label = int(self.labels.iloc[idx])
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_len,
+            return_tensors='pt'
+        )
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+# Create datasets and dataloaders for rating prediction using BERT
+train_dataset_rating_bert = RatingDatasetBERT(X_train_rating, y_train_rating_adjusted, tokenizer_bert)
+test_dataset_rating_bert = RatingDatasetBERT(X_test_rating, y_test_rating_adjusted, tokenizer_bert)
+
+train_loader_rating_bert = DataLoader(train_dataset_rating_bert, batch_size=32, shuffle=True)
+test_loader_rating_bert = DataLoader(test_dataset_rating_bert, batch_size=32, shuffle=False)
+
+# Load DistilBERT model for sequence classification - 5 labels for ratings 1-5
+model_rating_bert = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=5) # 5 labels for ratings 1-5
+model_rating_bert.to(device)
+
+# Optimizer and criterion
+optimizer_rating_bert = optim.AdamW(model_rating_bert.parameters(), lr=2e-5)
+criterion_rating_bert = nn.CrossEntropyLoss()
+
+# Train the DistilBERT model for rating prediction
+bert_history_rating = train_model_bert(model_rating_bert, train_loader_rating_bert, optimizer_rating_bert, criterion_rating_bert, epochs=15, device=device) # Increased epochs for potentially better performance
+
+# Evaluate the model
+y_true_rating_bert, y_pred_rating_bert = evaluate_model_bert(model_rating_bert, test_loader_rating_bert, device=device)
+
+# Convert predictions back to original rating scale (1-5)
+y_pred_rating_bert = np.array(y_pred_rating_bert) + 1
+y_true_rating_bert = np.array(y_true_rating_bert) + 1
+
+# Calculate accuracy and print classification report
+accuracy_rating_distilbert = accuracy_score(y_true_rating_bert, y_pred_rating_bert)
+print(f"Accuracy (DistilBERT for rating prediction): {accuracy_rating_distilbert:.4f}")
+print("\nClassification Report (DistilBERT for rating prediction):")
+print(classification_report(y_true_rating_bert, y_pred_rating_bert))
+
+# Confusion Matrix for DistilBERT Rating Prediction
+cm_rating_bert = confusion_matrix(y_true_rating_bert, y_pred_rating_bert)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm_rating_bert, annot=True, fmt='d', cmap='Blues',
+            xticklabels=[1, 2, 3, 4, 5],
+            yticklabels=[1, 2, 3, 4, 5])
+plt.xlabel('Predicted Rating')
+plt.ylabel('True Rating')
+plt.title('Confusion Matrix: TF-IDF + Neural Network for Ratings')
+plt.tight_layout()
+plt.show()
+
+# Plot training history for BERT Rating Prediction
+plt.figure(figsize=(12, 5))
+
+# Plot accuracy
+plt.subplot(1, 2, 1)
+plt.plot(bert_history_rating['accuracy'], label='Train Accuracy')
+plt.title('Model Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+# Plot loss
+plt.subplot(1, 2, 2)
+plt.plot(bert_history_rating['loss'], label='Train Loss')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# Compare all model accuracies for rating prediction including BERT
+models_rating_all_bert = ['BoW + LogReg', 'TF-IDF + LogReg', 'TF-IDF + NN', 'DistilBERT']
+accuracies_rating_all_bert = [accuracy_bow_rating_logistic, accuracy_tfidf_rating_logistic, accuracy_nn, accuracy_rating_distilbert]
+
+df_metrics_rating_all_bert = pd.DataFrame({'Model': models_rating_all_bert, 'Accuracy': accuracies_rating_all_bert})
+
+plt.figure(figsize=(10, 6))
+ax_rating_all_bert = sns.barplot(x='Model', y='Accuracy', data=df_metrics_rating_all_bert, palette=['#FF9671', '#FFC75F', '#845EC2', '#A020F0']) # Added purple for BERT
+for i, acc in enumerate(accuracies_rating_all_bert):
+    ax_rating_all_bert.text(i, acc + 0.005, f'{acc:.4f}', ha='center', fontweight='bold')
+
+plt.title('Model Accuracy Comparison for Multiclass Rating Prediction (including DistilBERT)', fontsize=16)
+plt.ylabel('Accuracy', fontsize=14)
+plt.ylim(0, 0.6) # Adjust y-axis limit
+
+plt.tight_layout()
+plt.show()
+```
+
+Here, DistilBERT achieved an accuracy of **57.50%**. The confusion matrix is as shown below.
+
+![Bert confusion matrix](./Bert_confusion_matrix.png)
+
+DistilBERT also showed the best performance in multiclass rating prediction, achieving a higher accuracy than the simpler models. This further reinforces the effectiveness of transformer models for understanding nuanced text data like book reviews, though with increased computational cost.
+
+### Rating Prediction Results
+
+Predicting the exact star rating out of five proved to be more challenging, whih is to be expected with more classes to choose from. None of the simple techniques managed to achieve 50% accuracy, but it was reassuring seeing the confusion matrices where the models would usually still be within one point of the true rating when it got confused. Of course, we see that DistilBERT performed superior to the other models, at a whole 8% more accuracy than the next best of TF-IDF with Logistic Regression. This improvement suggests that the context and understanding of nuances may have helped it distinguish reviews better. For example, a sentence like "I had high hopes, but it was just okay in the end" might have high coefficients for words like "high" and "hopes" while the word "okay" might not push the score down very much. A logistic model might struggle on rating this sentence.
+
+Of course, we must also note that user ratings are very variable and the exact same review text could be a 5 rating by one user and a 3 rating by another user, so in that context all of the models performed remarkably well in predicting ratings based on just review text.
+
+## Results, Analysis, and Discussion
+
+### Summary of Results
+
+| Model                              | Task               | Accuracy |
+|------------------------------------|--------------------|----------|
+| Bag of Words + Logistic Regression | Sentiment Analysis | 0.7448   |
+| TF-IDF + Logistic Regression       | Sentiment Analysis | 0.7770   |
+| TF-IDF + Neural Networks           | Sentiment Analysis | 0.7410   |
+| DistilBERT                         | Sentiment Analysis | 0.8040   |
+| Bag of Words + Logistic Regression | Rating Prediction  | 0.4567   |
+| TF-IDF + Logistic Regression       | Rating Prediction  | 0.4935   |
+| TF-IDF + Neural Network            | Rating Prediction  | 0.4487   |
+| DistilBERT                         | Rating Prediction  | 0.5750   |
+
+To recap, in both sentiment analysis and rating prediction tasks, DistilBERT consistently outperformed the traditional machine learning models (Logistic Regression with Bag-of-Words or TF-IDF features). For sentiment analysis, DistilBERT achieved an accuracy of 80.4%, a noticeable improvement over TF-IDF Logistic Regression (77.7%) and Bag-of-Words Logistic Regression (74.5%).
+
+For the more challenging task of multiclass rating prediction, all models showed lower accuracies, as expected. However, DistilBERT again led with an accuracy of 57.5%, which is significantly better than TF-IDF Logistic Regression (49.4%) and Bag-of-Words Logistic Regression (45.7%). Interestingly, the simple Neural Network did not improve upon the Logistic Regression models for rating prediction, suggesting that model complexity alone is not sufficient and that the pre-trained language understanding capabilities of DistilBERT are crucial for these tasks.
+
+## Impact
+
+The BookGraph sentiment and rating models have several potential use cases, as well as limitations and ethical considerations.
+
+A system that can automatically analyze book review text to determine sentiment or predict a likely rating could be useful in multiple ways.
+For readers, such models could summarize the general reception of the book. The sentiment model could estimate what percentage are positive vs negative, complementing the numerical average rating. It could also highlight a few representative highly positive or highly negative reviews by detecting sentiment extremes.
+For authors and publishers, sentiment analysis could provide analysis on which parts of the book readers liked or disliked, which could be inferred by looking at common words in 1-star vs 5-star reviews. 
+Another potential impact is in moderation or recommendation systems on a platform like Goodreads. Our sentiment classifier could flag reviews that are extremely negative or extremely positive. Perhaps a platform might want to automatically detect maliciously negative reviews or spam, sentiment analysis could be one component of a larger system. 
+
+One positive aspect of simpler models like logistic regression is their explainability. We can directly tell a user or stakeholder, this review was marked negative because it contained words like ‘boring’ and ‘waste of time’ which are strong negative indicators. This transparency is important for trust. In contrast, a DistilBERT model would be a black box. Even if it’s more accurate, an author might not trust an AI assessment of their review without knowing why. 
+
+### Limitations
+ The models inherit biases from the data. Goodreads users and their behaviors introduce bias. For instance we saw, most reviews are positive. A sentiment model might thus be biased towards predicting positive. If deployed, it might systematically undercount negative feedback. Moreover, certain genres had slightly higher ratings. The model might pick up on genre-specific language that the mode associates with higher ratings. This could be a form of genre bias i.e. the model could mistakenly give a higher predicted rating for a review just because it uses the style common in children’s literature reviews which typically has high review rating. If the system’s output influences any decisions (say highlighting a review or not), this could unfairly amplify some biases.
+ 
+ From an ethical standpoint, using AI to summarize opinions needs caution. Reviews are personal expressions, reducing them to “positive” or “negative” tags could lead to loss in nuance of the review. For example, marking a 3-star review as “negative” as our binary definition did, might not align with the author’s intent if they intended it as mixed or slightly positive. 
+
+## Conclusion
+
+This project successfully explored sentiment analysis and rating prediction for book reviews using a variety of machine learning and deep learning techniques. We found that while simpler models like Logistic Regression provide a baseline understanding, transformer-based models like DistilBERT significantly improve performance, particularly for nuanced tasks like sentiment and rating prediction from long-form text reviews. The insights gained from this project can contribute to enhancing book recommendation systems, providing valuable feedback to authors and publishers, and improving the overall reader experience on platforms like Goodreads. Further research, as discussed, can build upon these findings to develop even more accurate and impactful book review analysis tools.
+
+## References
+
+Gebru, T., Morgenstern, J., Vecchione, B., Vaughan, J. W., Wallach, H., Daumé III, H., & Crawford, K. (2018). Datasheets for datasets. *Communications of the ACM*, *61*(12), 86-94.
+
+Wan, M., & McAuley, J. J. (2018, October). Item recommendation on monotonic behavior chains. In *Proceedings of the 12th ACM conference on recommender systems* (pp. 86-94).
+
+Wan, M., Misra, R., Nakashole, N., & McAuley, J. (2019, July). Fine-grained spoiler detection from large-scale review corpora. In *Proceedings of the 57th annual meeting of the association for computational linguistics* (pp. 2605-2610).
